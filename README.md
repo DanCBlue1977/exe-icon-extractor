@@ -28,7 +28,7 @@ python exe_icon_extractor.py
 
 ### Run pre-built executable
 
-Download `EXEIconExtractor.exe` from [Releases](../../releases) — no Python needed.
+Download `EXEIconExtractor.exe` from [Releases](https://github.com/DanCBlue1977/exe-icon-extractor/releases) — no Python needed.
 
 ## Build from source
 
@@ -76,4 +76,3 @@ Output: `dist\EXEIconExtractor.exe`
 ## License
 
 MIT
-"# exe-icon-extractor" 
