@@ -1,0 +1,13 @@
+name: icon-extractor
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - customtkinter>=5.2
+      - icoextract>=0.1.5
+      - Pillow>=10.0
+      - lief>=0.14
+      - pefile>=2023.2.7
