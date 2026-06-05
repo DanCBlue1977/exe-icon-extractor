@@ -76,3 +76,4 @@ Output: `dist\EXEIconExtractor.exe`
 ## License
 
 MIT
+"# exe-icon-extractor" 
