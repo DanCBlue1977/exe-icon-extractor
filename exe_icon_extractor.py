@@ -315,12 +315,26 @@ def inject_icon(exe_path: str, ico_bytes: bytes, output_path: str) -> tuple[bool
             if not lang_node.is_data:
                 continue
             orig_data = bytes(lang_node.content)
-            sz = _dib_size(orig_data)
-            if sz is None:
-                skipped += 1
-                continue
 
-            ow, oh = sz
+            # Detecta o formato e dimensões do frame original
+            is_png_frame = orig_data[:8] == b"\x89PNG\r\n\x1a\n"
+
+            if is_png_frame:
+                # Frame PNG raw (256px+) — lê dimensões do header PNG
+                try:
+                    orig_img = Image.open(io.BytesIO(orig_data))
+                    ow, oh = orig_img.size
+                except Exception:
+                    skipped += 1
+                    continue
+            else:
+                sz = _dib_size(orig_data)
+                if sz is None:
+                    skipped += 1
+                    continue
+                ow, oh = sz
+
+            # Procura frame correspondente no ICO novo
             new_dib = new_dibs.get((ow, oh))
 
             if new_dib is None:
@@ -336,8 +350,25 @@ def inject_icon(exe_path: str, ico_bytes: bytes, output_path: str) -> tuple[bool
                     skipped += 1
                     continue
 
+            # Para frames que eram PNG no original, guarda como PNG no output
+            if is_png_frame:
+                try:
+                    # Converte o DIB de volta para PNG para manter o formato original
+                    wrap = (struct.pack("<HHH", 0, 1, 1) +
+                            struct.pack("<BBBBHHII",
+                                        ow if ow < 256 else 0, oh if oh < 256 else 0,
+                                        0, 0, 1, 32, len(new_dib), 22) + new_dib)
+                    tmp_img = Image.open(io.BytesIO(wrap)).convert("RGBA")
+                    buf = io.BytesIO()
+                    tmp_img.save(buf, format="PNG")
+                    new_content = buf.getvalue()
+                except Exception:
+                    new_content = new_dib  # fallback para DIB se PNG falhar
+            else:
+                new_content = new_dib
+
             # Substitui o conteúdo — LIEF reconstrói a secção com o tamanho certo
-            lang_node.content = bytes(new_dib)
+            lang_node.content = bytes(new_content)
             replaced += 1
 
     if replaced == 0:
@@ -695,6 +726,293 @@ class InjectTab(ctk.CTkFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Separador — Criar ICO a partir de PNG/imagem
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Tamanhos standard Windows (todos os contextos cobertos)
+ICO_SIZES = [16, 24, 32, 40, 48, 64, 72, 96, 128, 256]
+
+
+class SizeToggle(ctk.CTkFrame):
+    """Botão toggle para activar/desactivar um tamanho no ICO."""
+    def __init__(self, master, size: int, enabled: bool = True, **kw):
+        super().__init__(master, fg_color="transparent", **kw)
+        self.size = size
+        self._var = ctk.BooleanVar(value=enabled)
+        self._btn = ctk.CTkCheckBox(
+            self, text=f"{size}×{size}",
+            variable=self._var,
+            font=("Consolas", 11),
+            text_color=TEXT,
+            fg_color=ACCENT,
+            hover_color=ACCENT2,
+            border_color=BORDER,
+            checkmark_color=TEXT,
+            width=100)
+        self._btn.pack()
+
+    @property
+    def active(self) -> bool:
+        return self._var.get()
+
+
+class CreateIcoTab(ctk.CTkFrame):
+    def __init__(self, master, **kw):
+        super().__init__(master, fg_color="transparent", **kw)
+        self._src_img: "Image.Image | None" = None
+        self._src_path: str = ""
+        self._toggles: list[SizeToggle] = []
+        self._build()
+
+    def _build(self):
+        # ── Coluna esquerda: fonte ────────────────────────────────────────────
+        left = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=12)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+        ctk.CTkLabel(left, text="① Imagem de origem",
+                     font=("Segoe UI", 13, "bold"), text_color=TEXT
+                     ).pack(anchor="w", padx=20, pady=(16, 8))
+
+        ctk.CTkLabel(left,
+                     text="PNG, JPG, BMP, WEBP — recomendado 512×512 ou maior",
+                     font=("Segoe UI", 10), text_color=MUTED
+                     ).pack(anchor="w", padx=20)
+
+        ctk.CTkButton(left, text="📂 Selecionar imagem", width=170, height=34,
+                      corner_radius=8, fg_color=ACCENT, hover_color=ACCENT2,
+                      font=("Segoe UI", 12),
+                      command=self._pick_image).pack(anchor="w", padx=20, pady=(10, 0))
+
+        # Preview
+        self._preview_lbl = ctk.CTkLabel(left, text="—", font=("Segoe UI", 28))
+        self._preview_lbl.pack(pady=(16, 4))
+
+        self._src_info = ctk.CTkLabel(left, text="",
+                                       font=("Consolas", 10), text_color=MUTED)
+        self._src_info.pack(padx=20)
+
+        # ── Coluna central: tamanhos ──────────────────────────────────────────
+        mid = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=12)
+        mid.pack(side="left", fill="both", expand=True, padx=8)
+
+        ctk.CTkLabel(mid, text="② Tamanhos a incluir",
+                     font=("Segoe UI", 13, "bold"), text_color=TEXT
+                     ).pack(anchor="w", padx=20, pady=(16, 4))
+
+        ctk.CTkLabel(mid,
+                     text="Selecciona os tamanhos para o ficheiro .ico\n"
+                          "Recomendado: activar todos",
+                     font=("Segoe UI", 10), text_color=MUTED, justify="left"
+                     ).pack(anchor="w", padx=20, pady=(0, 10))
+
+        # Grid de checkboxes
+        grid = ctk.CTkFrame(mid, fg_color="transparent")
+        grid.pack(anchor="w", padx=20)
+
+        for i, sz in enumerate(ICO_SIZES):
+            # 256px activado por defeito, todos os outros também
+            t = SizeToggle(grid, sz, enabled=True)
+            t.grid(row=i // 2, column=i % 2, padx=4, pady=3, sticky="w")
+            self._toggles.append(t)
+
+        # Botões select all / none
+        btn_row = ctk.CTkFrame(mid, fg_color="transparent")
+        btn_row.pack(anchor="w", padx=20, pady=(10, 0))
+        ctk.CTkButton(btn_row, text="Todos", width=70, height=26,
+                      corner_radius=6, fg_color=CARD, hover_color=BORDER,
+                      border_width=1, border_color=BORDER,
+                      font=("Segoe UI", 10),
+                      command=lambda: self._set_all(True)
+                      ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Nenhum", width=70, height=26,
+                      corner_radius=6, fg_color=CARD, hover_color=BORDER,
+                      border_width=1, border_color=BORDER,
+                      font=("Segoe UI", 10),
+                      command=lambda: self._set_all(False)
+                      ).pack(side="left")
+
+        # ── Coluna direita: gerar ─────────────────────────────────────────────
+        right = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=12)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+        ctk.CTkLabel(right, text="③ Gerar ICO",
+                     font=("Segoe UI", 13, "bold"), text_color=TEXT
+                     ).pack(anchor="w", padx=20, pady=(16, 8))
+
+        # Opção de resampling
+        ctk.CTkLabel(right, text="Filtro de redimensionamento:",
+                     font=("Segoe UI", 11), text_color=MUTED
+                     ).pack(anchor="w", padx=20)
+
+        self._filter_var = ctk.StringVar(value="LANCZOS")
+        filter_menu = ctk.CTkOptionMenu(
+            right,
+            values=["LANCZOS", "BICUBIC", "BILINEAR", "NEAREST"],
+            variable=self._filter_var,
+            width=160, height=30,
+            fg_color=CARD, button_color=ACCENT,
+            button_hover_color=ACCENT2,
+            font=("Consolas", 11))
+        filter_menu.pack(anchor="w", padx=20, pady=(4, 16))
+
+        self._btn_generate = ctk.CTkButton(
+            right, text="🎨 Gerar e Guardar ICO",
+            width=200, height=42, corner_radius=10,
+            fg_color=ACCENT, hover_color=ACCENT2,
+            font=("Segoe UI", 13, "bold"),
+            command=self._generate, state="disabled")
+        self._btn_generate.pack(anchor="w", padx=20)
+
+        # Resultado
+        self._result_frame = ctk.CTkFrame(right, fg_color=CARD, corner_radius=10)
+        self._result_frame.pack(fill="x", padx=16, pady=(16, 0))
+        self._result_lbl = ctk.CTkLabel(
+            self._result_frame,
+            text="Seleccione uma imagem para começar.",
+            font=("Segoe UI", 11), text_color=MUTED,
+            wraplength=260, justify="left")
+        self._result_lbl.pack(padx=14, pady=12)
+
+        # Preview do ICO gerado
+        ctk.CTkLabel(right, text="Preview do ICO gerado:",
+                     font=("Segoe UI", 11), text_color=MUTED
+                     ).pack(anchor="w", padx=20, pady=(16, 4))
+
+        self._ico_preview_row = ctk.CTkFrame(right, fg_color="transparent")
+        self._ico_preview_row.pack(anchor="w", padx=20, fill="x")
+
+    # ── Selecção de imagem ────────────────────────────────────────────────────
+    def _pick_image(self):
+        path = filedialog.askopenfilename(
+            title="Selecionar imagem",
+            filetypes=[
+                ("Imagens", "*.png *.jpg *.jpeg *.bmp *.webp *.tiff *.gif"),
+                ("Todos", "*.*")])
+        if not path:
+            return
+        try:
+            img = Image.open(path).convert("RGBA")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Não foi possível abrir a imagem:\n{e}")
+            return
+
+        self._src_img  = img
+        self._src_path = path
+
+        # Preview
+        ctk_img = _make_ctk_img(img, 96)
+        self._preview_lbl.configure(image=ctk_img, text="")
+        self._preview_lbl._ctk_img = ctk_img
+
+        w, h = img.size
+        self._src_info.configure(
+            text=f"{Path(path).name}\n{w}×{h}px  ·  {img.mode}")
+
+        self._btn_generate.configure(state="normal")
+
+    def _set_all(self, state: bool):
+        for t in self._toggles:
+            t._var.set(state)
+
+    # ── Geração do ICO ────────────────────────────────────────────────────────
+    def _generate(self):
+        if self._src_img is None:
+            return
+
+        active_sizes = [t.size for t in self._toggles if t.active]
+        if not active_sizes:
+            messagebox.showwarning("Sem tamanhos", "Selecciona pelo menos um tamanho.")
+            return
+
+        # Sugestão de nome baseada no ficheiro fonte
+        stem = Path(self._src_path).stem if self._src_path else "icon"
+        dest = filedialog.asksaveasfilename(
+            title="Guardar ICO",
+            defaultextension=".ico",
+            filetypes=[("ICO", "*.ico")],
+            initialfile=f"{stem}.ico")
+        if not dest:
+            return
+
+        self._btn_generate.configure(state="disabled", text="A gerar…")
+
+        def worker():
+            try:
+                ok, msg, previews = _generate_ico(
+                    self._src_img, active_sizes,
+                    self._filter_var.get(), dest)
+            except Exception as e:
+                ok, msg, previews = False, str(e), []
+
+            def done():
+                self._btn_generate.configure(state="normal",
+                                              text="🎨 Gerar e Guardar ICO")
+                if ok:
+                    self._result_lbl.configure(text=f"✓ ICO gerado!\n{msg}",
+                                                text_color=SUCCESS)
+                    self._show_ico_preview(previews)
+                else:
+                    self._result_lbl.configure(text=f"✗ Erro:\n{msg}",
+                                                text_color=ERROR_COL)
+
+            self.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_ico_preview(self, previews: list):
+        """Mostra miniaturas dos frames gerados."""
+        for w in self._ico_preview_row.winfo_children():
+            w.destroy()
+        for img, sz in previews[:8]:   # mostra no máximo 8
+            f = ctk.CTkFrame(self._ico_preview_row, fg_color="transparent")
+            f.pack(side="left", padx=3)
+            thumb = _make_ctk_img(img, 32)
+            lbl = ctk.CTkLabel(f, image=thumb, text="")
+            lbl._ctk_img = thumb
+            lbl.pack()
+            ctk.CTkLabel(f, text=str(sz), font=("Consolas", 8),
+                         text_color=MUTED).pack()
+
+
+def _generate_ico(src_img: "Image.Image", sizes: list[int],
+                  filter_name: str, dest_path: str
+                  ) -> tuple[bool, str, list]:
+    """
+    Gera um ICO multi-frame a partir de uma imagem PIL.
+    Retorna (sucesso, mensagem, [(img, size), ...] para preview).
+    """
+    filter_map = {
+        "LANCZOS":  Image.LANCZOS,
+        "BICUBIC":  Image.BICUBIC,
+        "BILINEAR": Image.BILINEAR,
+        "NEAREST":  Image.NEAREST,
+    }
+    resample = filter_map.get(filter_name, Image.LANCZOS)
+
+    frames = []
+    previews = []
+
+    for sz in sorted(sizes):
+        resized = src_img.resize((sz, sz), resample).convert("RGBA")
+        frames.append(resized)
+        previews.append((resized.copy(), sz))
+
+    if not frames:
+        return False, "Sem frames para gerar", []
+
+    ico_bytes = build_ico_bytes(frames)
+    if not ico_bytes:
+        return False, "Erro ao montar ICO", []
+
+    with open(dest_path, "wb") as f:
+        f.write(ico_bytes)
+
+    sizes_str = ", ".join(f"{s}×{s}" for s in sorted(sizes))
+    msg = f"{len(frames)} tamanhos: {sizes_str}\nGuardado em: {Path(dest_path).name}"
+    return True, msg, previews
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  App principal com separadores
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -732,9 +1050,11 @@ class App(ctk.CTk):
 
         self._tabs.add("📤  Extrair Ícones")
         self._tabs.add("📥  Injetar ICO")
+        self._tabs.add("🎨  Criar ICO")
 
         self._build_extract_tab(self._tabs.tab("📤  Extrair Ícones"))
         InjectTab(self._tabs.tab("📥  Injetar ICO")).pack(fill="both", expand=True, padx=8, pady=8)
+        CreateIcoTab(self._tabs.tab("🎨  Criar ICO")).pack(fill="both", expand=True, padx=8, pady=8)
 
     # ── Separador Extrair ─────────────────────────────────────────────────────
     def _build_extract_tab(self, tab):
